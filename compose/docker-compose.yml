@@ -1,0 +1,19 @@
+services:
+  product-agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: product-agent:0.1.0
+    container_name: product-agent
+    restart: unless-stopped
+    # host networking like the other agents: listens on :7809, reaches the model (:8500), reqoach
+    # (:7802) and the Analyst relay (:7803) on localhost.
+    network_mode: host
+    environment:
+      PROJECT_REPOS_ROOT: "/app/project-repos"       # the shared repo tree (reads requirements/, writes product/)
+      PRODUCT_LLM_URL: "http://127.0.0.1:8500"        # the active chat model (llama.cpp), same as the builder
+      REQOACH_URL: "http://localhost:7802"            # commit the product area (BFF owns git)
+      FACTORY_RELAY_URL: "http://localhost:7803"       # Analyst socket.io hub (live Product lane)
+    volumes:
+      - ../data:/app/data
+      - /home/logus/env/project-repos:/app/project-repos
