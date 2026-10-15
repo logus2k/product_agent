@@ -8,6 +8,11 @@ services:
     restart: unless-stopped
     # host networking like the other agents: listens on :7809, reaches the model (:8500), reqoach
     # (:7802) and the Analyst relay (:7803) on localhost.
+    # Run as the host user, not root. These services write into the shared project
+    # repos; as root they leave root-owned artifacts that any agent running as the
+    # host user then cannot overwrite (this broke the deploy agent's Dockerfile
+    # write). None of them needs root — no docker.sock, no privileged port.
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
     network_mode: host
     environment:
       PROJECT_REPOS_ROOT: "/app/project-repos"       # the shared repo tree (reads requirements/, writes product/)

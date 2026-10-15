@@ -43,11 +43,34 @@ def _resolve_model() -> str:
     return "gemma-4-12b"
 
 
+class RequirementsNotPublished(RuntimeError):
+    """The Analyst's package has not been snapshotted into the project repo yet.
+
+    Raised instead of letting a bare FileNotFoundError escape: the missing file is a
+    STEP not taken, not a broken install, and the raw path tells the reader nothing
+    about what to do. The package reaches `requirements/` when the set is signed off
+    (reqoach's publish:requirements), so the fix is upstream of this stage.
+    """
+
+
 def _load_requirements(pid: str) -> dict:
     """Read the Analyst's requirements package for the project."""
     p = os.path.join(REPOS_ROOT, pid, "requirements", "package.json")
-    with open(p, encoding="utf-8") as f:
-        return json.load(f)
+    if not os.path.isfile(p):
+        raise RequirementsNotPublished(
+            "the requirements package has not been published to this project's repository yet "
+            f"(expected {p}). The Analyst writes it there when the requirement set is signed off: "
+            "close the open coverage gaps, approve the release (draft -> validated), and the "
+            "package is published automatically. To publish an already-released set, POST "
+            f"/repos/{pid}/publish:requirements on reqoach."
+        )
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        raise RequirementsNotPublished(
+            f"the requirements package at {p} is not valid JSON ({e}); re-publish it from reqoach"
+        ) from e
 
 
 def _problem_text(ps) -> str:
@@ -110,12 +133,20 @@ _SCHEMA_HINT = """Return STRICT JSON only (no markdown, no prose) with EXACTLY t
   ],
   "screens": [
     {"id":"home","title":"...","surface":"public","audience":"public","primary_persona":"diner",
-     "is_landing":true,"purpose":"what the user does here","key_actions":["..."],
-     "requirements":["REQ-0001"]}
+     "is_landing":true,"purpose":"what the user does here","requirements":["REQ-0001"],
+     "actions":[
+       {"id":"browse_menu","label":"Browse the menu","kind":"list","entity":"menu_item"},
+       {"id":"start_booking","label":"Book a table","kind":"create","entity":"reservation"}
+     ]}
   ],
   "journeys": [
-    {"id":"book_table","persona":"diner","name":"Book a table",
-     "steps":["land on public menu","...","confirmation"],"entry_screen":"home"}
+    {"id":"book_table","persona":"diner","name":"Book a table","entry_screen":"home",
+     "creates":["reservation"],"state":["reservation_id"],
+     "flow":[
+       {"screen":"home","action":"start_booking"},
+       {"screen":"booking_form","action":"submit_reservation"},
+       {"screen":"confirmation","action":"view_confirmation"}
+     ]}
   ],
   "navigation": {
     "public": [{"label":"Menu","screen":"home"}],
@@ -128,6 +159,22 @@ surfaces (public vs authenticated). The landing screen is the PRIMARY user's ent
 one), NOT an index of internal modules. Every screen must map to >=1 requirement id. Frame screens as
 USER TASKS, not database tables. Keep it faithful to the requirements — invent no features.
 
+INTERACTION DESIGN (this is what makes the product buildable, not just a picture). For every screen list
+its concrete `actions` — each is one thing a user DOES on that screen:
+- `kind` is EXACTLY one of: create | list | view | update | delete | search | navigate. (These are the
+  only allowed values — they map to how the system realizes the action. Use `create` for anything that
+  ADDS a record, `update`/`delete` for changing/removing one, `list`/`view`/`search` for reading, and
+  `navigate` for moving to another screen with no data change.)
+- `entity` is the data thing the action reads or writes (a noun from the requirements' domain, e.g.
+  reservation, order, product). `navigate` actions may omit it.
+For every `journey`, give the ordered `flow` as (screen, action) steps that reference REAL screen ids and
+REAL action ids on those screens; list in `state` the identifiers carried between steps (e.g. the id of a
+record made in an earlier step and used later); and list in `creates` every entity the journey MUST bring
+into being. HARD RULE: if a journey `creates` an entity, its `flow` MUST include at least one step whose
+action `kind` is `create` for that entity, on a screen the user can actually reach from the entry screen —
+otherwise the journey can never complete. A create action is what turns a page into a working feature; do
+not describe a purchase/booking/submission journey whose create step has no create action.
+
 FAITHFULNESS OF THE WORDING: `product_name` and `one_liner` must plainly restate what THIS system is,
 grounded in the PROBLEM STATEMENT above. Describe it in the requirements' own terms. Do NOT add
 positioning or marketing framing that the requirements do not state — for example do NOT call it a
@@ -139,10 +186,12 @@ claim that isn't supported there."""
 
 def _generate_spec(digest: str, log=print) -> dict:
     """Ask the active model to design the product from the requirements; return the parsed spec dict."""
-    prompt = ("You are a senior PRODUCT DESIGNER. Given the requirements of an application, define the "
-              "PRODUCT a real user would use: the distinct user roles, the primary user journeys, and the "
-              "information architecture — which surfaces are public vs authenticated, the screen map, the "
-              "navigation, and the landing experience. Design the EXPERIENCE that satisfies the "
+    prompt = ("You are a senior PRODUCT & UX DESIGNER. Given the requirements of an application, define the "
+              "PRODUCT a real user would use AND how they move through it: the distinct user roles, the "
+              "information architecture (which surfaces are public vs authenticated, the screen map, the "
+              "navigation, the landing experience), and — crucially — the INTERACTION DESIGN: the concrete "
+              "actions on each screen and the step-by-step journeys that connect them, so every task a user "
+              "must accomplish has a real, reachable control. Design the EXPERIENCE that satisfies the "
               "requirements; do not mirror the system's internal modules.\n\n"
               + _SCHEMA_HINT + "\n\n=== REQUIREMENTS ===\n" + digest)
     body = json.dumps({"model": _resolve_model(),
@@ -178,6 +227,26 @@ def _parse_json(text: str) -> dict:
         raise
 
 
+#: The only realization-kinds an action may declare — they map onto how the system implements the action
+#: (create/list/view/update/delete/search echo the CRUD verbs downstream; navigate is a pure screen move).
+_ACTION_KINDS = {"create", "list", "view", "update", "delete", "search", "navigate"}
+
+
+def _normalize_interaction(spec: dict) -> None:
+    """Keep the structured interaction design and the legacy free-text fields in sync, IN PLACE. The
+    structured `actions`/`flow` are the source of truth (the Architect binds operations to them, the Builder
+    wires controls to them); the older `key_actions`/`steps` are back-filled from them so existing readers
+    that expect prose keep working. Additive and defensive — never raises on a partial spec."""
+    for s in (spec.get("screens") or []):
+        acts = s.get("actions") or []
+        if acts and not s.get("key_actions"):
+            s["key_actions"] = [a.get("label") or a.get("id") for a in acts if isinstance(a, dict)]
+    for j in (spec.get("journeys") or []):
+        flow = j.get("flow") or []
+        if flow and not j.get("steps"):
+            j["steps"] = [f"{f.get('screen')}: {f.get('action')}" for f in flow if isinstance(f, dict)]
+
+
 def _validate(spec: dict) -> list[str]:
     """Return a list of problems; empty means the spec has the shape the Architect/Builder need."""
     problems = []
@@ -192,6 +261,32 @@ def _validate(spec: dict) -> list[str]:
         problems.append("no public screen (every app needs an entry a first-time user can reach)")
     if len(spec.get("personas") or []) < 1:
         problems.append("no personas")
+
+    # INTERACTION-DESIGN invariants — this is what makes journeys buildable rather than improvised.
+    actions_by_screen = {s.get("id"): {a.get("id"): a for a in (s.get("actions") or []) if isinstance(a, dict)}
+                         for s in screens}
+    all_actions = [a for m in actions_by_screen.values() for a in m.values()]
+    if screens and not all_actions:
+        problems.append("no screen declares any `actions` (the interaction design is missing)")
+    for a in all_actions:
+        if a.get("kind") not in _ACTION_KINDS:
+            problems.append(f"action '{a.get('id')}' has invalid kind '{a.get('kind')}' "
+                            f"(allowed: {sorted(_ACTION_KINDS)})")
+    for j in (spec.get("journeys") or []):
+        jid = j.get("id")
+        flow = j.get("flow") or []
+        for f in flow:
+            sc, ac = (f.get("screen") if isinstance(f, dict) else None), (f.get("action") if isinstance(f, dict) else None)
+            if sc not in actions_by_screen:
+                problems.append(f"journey '{jid}' step references unknown screen '{sc}'")
+            elif ac not in actions_by_screen.get(sc, {}):
+                problems.append(f"journey '{jid}' step references unknown action '{ac}' on screen '{sc}'")
+        # a journey that must CREATE an entity needs a reachable create action for it
+        for ent in (j.get("creates") or []):
+            has_create = any((actions_by_screen.get(f.get("screen"), {}).get(f.get("action"), {}) or {}).get("kind") == "create"
+                             for f in flow if isinstance(f, dict))
+            if not has_create:
+                problems.append(f"journey '{jid}' claims to create '{ent}' but its flow has no create action")
     return problems
 
 
@@ -243,6 +338,7 @@ def design(pid: str, log=print) -> dict:
         except Exception as e:  # noqa: BLE001
             log(f"generation attempt {attempt} failed: {type(e).__name__}: {str(e)[:120]}")
             continue
+        _normalize_interaction(spec)          # keep structured actions/flow and legacy prose fields in sync
         problems = _validate(spec)
         if not problems:
             break
